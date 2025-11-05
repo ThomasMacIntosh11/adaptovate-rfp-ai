@@ -1,23 +1,33 @@
-# backend/rfp_scraper.py
-import os
-from typing import List, Dict, Any
-
-from .rfp_sources_canadabuys import fetch_canadabuys_tenders
-
-def _env_list(name: str) -> List[str]:
-    val = os.getenv(name, "") or ""
-    return [v.strip() for v in val.split(",") if v.strip()]
-
-def scrape_real_rfps() -> List[Dict[str, Any]]:
+def scrape_real_rfps() -> list[dict[str, any]]:
     """
-    Temporarily skip SAM.gov (rate-limited) and fetch only CanadaBuys tenders.
-    This guarantees real data flow while SAM rate limits reset or until we
-    re-enable SAM with a lower request profile.
+    Fetch CanadaBuys tenders and filter by keywords defined in .env.
     """
-    canada_items = []
+    import os
+    from .rfp_sources_canadabuys import fetch_canadabuys_tenders
+
+    # Load and normalize keywords from .env (comma-separated)
+    raw = os.getenv("FILTER_KEYWORDS", "")
+    keywords = [kw.strip().lower() for kw in raw.split(",") if kw.strip()]
+    print(f"[INFO] Applying keyword filters: {keywords if keywords else '(none)'}")
+
     try:
-        canada_items = fetch_canadabuys_tenders(max_rows=1000)
+        all_items = fetch_canadabuys_tenders(max_rows=2000)
     except Exception as e:
         print(f"[WARN] CanadaBuys fetch failed: {type(e).__name__}: {e}")
+        return []
 
-    return canada_items
+    print(f"[INFO] Retrieved {len(all_items)} total CanadaBuys tenders")
+
+    if not keywords:
+        print("[INFO] No keywords defined — returning all tenders.")
+        return all_items
+
+    # Filter by keyword appearing in title or description (case-insensitive)
+    filtered = []
+    for item in all_items:
+        hay = (item.get("title", "") + " " + item.get("description", "")).lower()
+        if any(kw in hay for kw in keywords):
+            filtered.append(item)
+
+    print(f"[INFO] Filtered down to {len(filtered)} tenders matching keywords.")
+    return filtered
