@@ -1,59 +1,86 @@
 # backend/ai_utils.py
 import os
-from pathlib import Path
+from typing import Dict
 from dotenv import load_dotenv
-from openai import OpenAI
 
-# Load the .env that lives in backend/ (works even when uvicorn runs from project root)
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+try:
+    from openai import OpenAI
+except Exception:
+    from openai import OpenAI  # fallback
+
+# Always load backend/.env no matter where uvicorn is started from
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 def _get_client() -> OpenAI:
     """
-    Lazily construct an OpenAI client using OPENAI_API_KEY from env.
-    This avoids failing at import time if the key hasn't been loaded yet.
+    Lazy-init OpenAI client so we don't require OPENAI_API_KEY at import time.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key or api_key.lower() == "none":
         raise RuntimeError(
-            "OPENAI_API_KEY is not set. Put it in backend/.env or export it in your shell."
+            "OPENAI_API_KEY is not set. Update backend/.env or export it in your shell."
         )
     return OpenAI(api_key=api_key)
 
-def summarize_rfp(text: str) -> str:
-    """Return a concise 5-sentence summary for consulting partners."""
+def summarize_rfp(rfp_text: str) -> str:
+    """Return a single-sentence plain-language summary for the card UI."""
     client = _get_client()
     prompt = (
-        "Summarize the following RFP for management/AI consulting partners in 5 short sentences. "
-        "Include: client/agency, problem, scope, key requirements, dates if present. "
-        "Keep it crisp and executive-ready.\n\n"
-        f"{text}"
+        "You are an expert proposal analyst for ADAPTOVATE. "
+        "Write exactly ONE sentence (<=30 words) that captures the buyer, goal, and key workstream of this RFP. "
+        "Avoid jargon, no bullet points, no introductions like 'This RFP...'." \
+        "\n\n"
+        f"RFP TEXT:\n{rfp_text}\n"
     )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
-
-def score_rfp(text: str, criteria: str) -> float:
-    """Return a numeric relevance score 0–100 based on criteria."""
-    client = _get_client()
-    prompt = (
-        "You are a bid/no-bid triage assistant. "
-        "Rate how well this RFP matches the firm's target work using ONLY a number 0-100.\n\n"
-        f"Target criteria: {criteria}\n\n"
-        f"RFP text:\n{text}\n\n"
-        "Return just the number."
-    )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    raw = resp.choices[0].message.content.strip()
     try:
-        import re
-        m = re.search(r"\d+(\.\d+)?", raw)
-        return float(m.group(0)) if m else 0.0
-    except Exception:
-        return 0.0
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": "You are a concise executive analyst."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.output_text if hasattr(resp, "output_text") else ""
+        if not content and hasattr(resp, "choices"):
+            content = resp.choices[0].message.content
+        return (content or "").strip()
+    except Exception as e:
+        return f"(summary unavailable: {type(e).__name__}: {e})"
+
+def score_relevance(rfp_text: str) -> Dict[str, int]:
+    """
+    Return {'score': 0..100, 'rationale': '...'} for fit to ADAPTOVATE focus (AI, Agile, Transformation).
+    """
+    client = _get_client()
+    prompt = (
+        "Score how well this opportunity fits a consulting firm focused on: "
+        "AI (including GenAI), agile coaching, transformations, product & digital strategy, "
+        "and change management. Consider whether it is services (not commodities), "
+        "government/public sector alignment, and clarity of scope. Return ONLY a JSON object "
+        "with fields: score (0-100 integer) and rationale (short string).\n\n"
+        f"TEXT:\n{rfp_text}\n"
+    )
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": "You are a disciplined evaluator. Output JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = resp.output_text if hasattr(resp, "output_text") else ""
+        if not raw and hasattr(resp, "choices"):
+            raw = resp.choices[0].message.content or ""
+
+        import json, re
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return {"score": 0, "rationale": "No JSON found from model output."}
+        data = json.loads(m.group(0))
+        sc = int(data.get("score", 0))
+        sc = max(0, min(100, sc))
+        return {"score": sc, "rationale": str(data.get("rationale", ""))[:400]}
+    except Exception as e:
+        return {"score": 0, "rationale": f"model error: {type(e).__name__}: {e}"}
