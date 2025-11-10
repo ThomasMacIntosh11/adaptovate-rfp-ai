@@ -4,7 +4,7 @@ import re
 from typing import List, Dict, Any
 
 from .rfp_sources_canadabuys import fetch_canadabuys_tenders
-from .rfp_sources_merx import fetch_merx_tenders
+from .rfp_sources_merx import fetch_merx_tenders, refresh_merx_snapshots
 
 def _env_list(name: str) -> List[str]:
     raw = os.getenv(name, "") or ""
@@ -100,6 +100,11 @@ def scrape_real_rfps(limit: int = 300) -> List[Dict[str, Any]]:
 
     enable_merx = os.getenv("ENABLE_MERX", "true").strip().lower() != "false"
     if enable_merx:
+        if os.getenv("MERX_AUTO_SNAPSHOT", "true").strip().lower() != "false":
+            try:
+                refresh_merx_snapshots()
+            except Exception as e:
+                print(f"[MERX] snapshot refresh failed: {type(e).__name__}: {e}")
         try:
             max_pages = int(os.getenv("MERX_MAX_PAGES", "2"))
             page_size = int(os.getenv("MERX_PAGE_SIZE", "40"))

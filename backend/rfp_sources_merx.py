@@ -139,6 +139,8 @@ def _normalize_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     posted = _first(rec, ["PublishedDate", "PublishDate", "PostingDate", "PostDate", "IssueDate", "PublicationDate"])
     posted = _format_date(posted)
+    due = _first(rec, ["ClosingDate", "CloseDate", "BidClosingDate", "Closing", "Closingdate"])
+    due = _format_date(due)
 
     return {
         "source": "MERX",
@@ -148,6 +150,7 @@ def _normalize_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "url": url or "",
         "category": "RFP",
         "posted_date": posted,
+        "due_date": due,
         "_force_unspsc_pass": True,
     }
 
@@ -278,6 +281,14 @@ def _parse_listing_html(html: str) -> List[Dict[str, Any]]:
         if not posted and container:
             posted = _extract_date_from_text(" ".join(container.stripped_strings))
         posted = _format_date(posted)
+        due_date = ""
+        if container:
+            closing_node = container.select_one(".closingDate .dateValue")
+            if closing_node:
+                due_date = _format_date(closing_node.get_text(strip=True))
+        if not due_date and container:
+            due_date = _extract_attr_value(container, ["closing", "due", "deadline"])
+            due_date = _format_date(due_date)
 
         description = ""
         if container:
@@ -300,6 +311,7 @@ def _parse_listing_html(html: str) -> List[Dict[str, Any]]:
             "url": full_url,
             "category": "RFP",
             "posted_date": posted,
+            "due_date": due_date,
             "_force_unspsc_pass": True,
         })
     return results
@@ -317,14 +329,7 @@ def _fetch_html_pages(session: requests.Session, base_url: str, max_pages: int) 
                 break
             resp.raise_for_status()
             parsed = _parse_listing_html(resp.text)
-            new_rows = []
-            for row in parsed:
-                url_key = row.get("url")
-                if not url_key or url_key in seen_urls:
-                    continue
-                seen_urls.add(url_key)
-                new_rows.append(row)
-            rows.extend(new_rows)
+            rows.extend(parsed)
             if not parsed:
                 break
         except Exception as e:
@@ -344,6 +349,27 @@ def _load_snapshot_file(path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"[MERX] Snapshot load failed: {type(e).__name__}: {e}")
     return []
+
+
+def refresh_merx_snapshots():
+    feeds = _merx_feeds()
+    if not feeds:
+        return []
+    refreshed = []
+    for feed in feeds:
+        path = Path(feed["snapshot_path"])
+        url = feed["url"]
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=90)
+            resp.raise_for_status()
+            timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            html = f"<!-- downloaded {timestamp} feed={feed['slug']} -->\n{resp.text}"
+            path.write_text(html, encoding="utf-8")
+            refreshed.append(str(path))
+            print(f"[MERX] Snapshot refreshed feed={feed['slug']} path={path} bytes={len(resp.text)}")
+        except Exception as e:
+            print(f"[MERX] Snapshot refresh failed feed={feed['slug']}: {type(e).__name__}: {e}")
+    return refreshed
 
 
 def fetch_merx_tenders(max_pages: int = 2, page_size: int = 40) -> List[Dict[str, Any]]:

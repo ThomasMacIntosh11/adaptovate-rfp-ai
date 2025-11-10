@@ -86,8 +86,16 @@ export default function App() {
 
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
-    if (!term) return rfps;
-    return rfps.filter((r) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const active = rfps.filter((r) => {
+      if (!r?.due_date) return true;
+      const parsed = new Date(r.due_date);
+      if (Number.isNaN(parsed.valueOf())) return true;
+      return parsed >= today;
+    });
+    if (!term) return active;
+    return active.filter((r) => {
       const hay = `${r?.title || ""} ${r?.summary || ""} ${r?.agency || ""}`.toLowerCase();
       return hay.includes(term);
     });

@@ -5,14 +5,14 @@ import sqlite3
 from datetime import datetime, date
 from typing import List, Optional
 
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Query, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from .rfp_scraper import scrape_real_rfps
 from .relevance import compute_rule_score
-from .ai_utils import summarize_rfp, score_relevance
+from .ai_utils import summarize_rfp, score_relevance, structured_summary
 
 # Always load env from backend folder
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -219,6 +219,24 @@ def _ensure_schema(conn: sqlite3.Connection):
             pass
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS saved_rfps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rfp_id INTEGER UNIQUE,
+                title TEXT,
+                agency TEXT,
+                summary TEXT,
+                description TEXT,
+                url TEXT,
+                score REAL,
+                posted_date TEXT,
+                due_date TEXT,
+                ai_summary TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
             UPDATE rfps
             SET dedupe_key = CASE
                 WHEN TRIM(IFNULL(title, '')) = '' AND TRIM(IFNULL(agency, '')) = '' AND TRIM(IFNULL(posted_date, '')) = ''
@@ -247,6 +265,9 @@ def _conn():
 class RefreshResponse(BaseModel):
     message: str
     errors: List[str] = []
+
+class SaveRequest(BaseModel):
+    generate_summary: bool = True
 
 @app.get("/progress")
 def get_progress():
@@ -338,6 +359,17 @@ def refresh_rfps(limit: int = 300, no_ai: bool = False):
     AI_TOP_N = int(os.getenv("AI_TOP_N", "30"))
     ALPHA = float(os.getenv("RELEVANCE_ALPHA", "0.6"))
     MIN_RULE_SCORE = float(os.getenv("MIN_RULE_SCORE", "40"))
+    today = date.today()
+
+    normalized_items = []
+    for it in items:
+        it["posted_date"] = _format_posted_date(it.get("posted_date", ""))
+        it["due_date"] = _format_due_date(it.get("due_date", ""))
+        due_dt = _iso_to_date(it.get("due_date"))
+        if due_dt and due_dt < today:
+            continue
+        normalized_items.append(it)
+    items = normalized_items
 
     def _dedupe_key(title: str, agency: str, posted_date: str) -> str:
         t = (title or "").strip() or "(untitled)"
@@ -354,6 +386,7 @@ def refresh_rfps(limit: int = 300, no_ai: bool = False):
         description = row.get("description", "")
         posted_date = (row.get("posted_date") or "").strip()
         posted_date = _format_posted_date(posted_date)
+        due_date = _format_due_date(row.get("due_date", ""))
         url_raw = (row.get("url") or "").strip()
         url_value = url_raw if url_raw else None
         score = float(row.get("score", 0.0))
@@ -362,8 +395,8 @@ def refresh_rfps(limit: int = 300, no_ai: bool = False):
 
         cur.execute(
             """
-            INSERT INTO rfps(title, agency, summary, description, url, score, posted_date, created_at, dedupe_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO rfps(title, agency, summary, description, url, score, posted_date, due_date, created_at, dedupe_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(dedupe_key) DO UPDATE SET
                 title=excluded.title,
                 agency=excluded.agency,
@@ -371,7 +404,8 @@ def refresh_rfps(limit: int = 300, no_ai: bool = False):
                 description=excluded.description,
                 url=COALESCE(excluded.url, rfps.url),
                 score=excluded.score,
-                posted_date=excluded.posted_date
+                posted_date=excluded.posted_date,
+                due_date=COALESCE(excluded.due_date, rfps.due_date)
             """,
             (
                 title,
@@ -381,6 +415,7 @@ def refresh_rfps(limit: int = 300, no_ai: bool = False):
                 url_value,
                 score,
                 posted_date,
+                due_date,
                 created_at,
                 dedupe_key,
             ),
@@ -420,9 +455,13 @@ def refresh_rfps(limit: int = 300, no_ai: bool = False):
             agency = (it.get("agency") or "").strip()
             description = (it.get("description") or "").strip()
             posted_date = (it.get("posted_date") or "").strip()
+            due_date = (it.get("due_date") or "").strip()
             url = (it.get("url") or "").strip()
 
-            rfp_text = f"{title}\n\nAgency: {agency}\n\n{description}\n\nURL: {url or '(pending)'}\nPosted: {posted_date}"
+            rfp_text = (
+                f"{title}\n\nAgency: {agency}\n\n{description}\n\nURL: {url or '(pending)'}"
+                f"\nPosted: {posted_date or '(unspecified)'}\nDue: {due_date or '(unspecified)'}"
+            )
 
             rule_score = float(it.get("_rule_score", 0.0))
             ai_score = 0.0
@@ -447,6 +486,7 @@ def refresh_rfps(limit: int = 300, no_ai: bool = False):
                 "url": url,
                 "score": float(round(final_score, 1)),
                 "posted_date": posted_date,
+                "due_date": due_date,
             }
             _upsert(row)
             ingested += 1

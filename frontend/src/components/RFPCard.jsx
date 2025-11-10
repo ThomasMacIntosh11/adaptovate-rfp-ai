@@ -1,5 +1,5 @@
 // frontend/src/components/RFPCard.jsx
-const formatPostedDate = (value) => {
+const formatDateLabel = (value) => {
   if (!value) return "";
   const parsed = new Date(value);
   if (!Number.isNaN(parsed.valueOf())) {
@@ -13,8 +13,10 @@ export default function RFPCard({ rfp }) {
   const agency = rfp?.agency || "";
   const url = rfp?.url || "";
   const score = typeof rfp?.score === "number" ? `${rfp.score.toFixed(1)}%` : "—";
-  const posted = formatPostedDate(rfp?.posted_date);
-  const tags = (Array.isArray(rfp?.focus_tags) && rfp.focus_tags.length ? rfp.focus_tags : ["Consulting"]).slice(0, 3);
+  const posted = formatDateLabel(rfp?.posted_date);
+  const due = formatDateLabel(rfp?.due_date);
+  const tags = (Array.isArray(rfp?.focus_tags) && rfp.focus_tags.length ? rfp.focus_tags : ["Strategy"]).slice(0, 3);
+  const summary = (rfp?.summary || rfp?.description || "").trim();
 
   const onClick = () => {
     if (url && /^https?:\/\//i.test(url)) {
@@ -35,6 +37,8 @@ export default function RFPCard({ rfp }) {
         ))}
       </div>
 
+      {summary ? <p className="card-summary">{summary}</p> : null}
+
       <div className="card-meta">
         <div className="meta-block">
           <span className="meta-label">Relevance</span>
@@ -43,6 +47,10 @@ export default function RFPCard({ rfp }) {
         <div className="meta-block">
           <span className="meta-label">Posted</span>
           <span className="meta-value">{posted || "—"}</span>
+        </div>
+        <div className="meta-block">
+          <span className="meta-label">Due</span>
+          <span className={`meta-value${due ? "" : " muted"}`}>{due || "—"}</span>
         </div>
       </div>
 
