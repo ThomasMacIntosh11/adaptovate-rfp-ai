@@ -4,18 +4,23 @@ import re
 import sqlite3
 from datetime import datetime, date
 from typing import List, Optional
+from pathlib import Path
 
-from fastapi import FastAPI, Query, Response, HTTPException
+from fastapi import FastAPI, Query, Response, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from .rfp_scraper import scrape_real_rfps
 from .relevance import compute_rule_score
-from .ai_utils import summarize_rfp, score_relevance, structured_summary
+from .ai_utils import summarize_rfp, score_relevance, structured_summary, strategic_insights
 
 # Always load env from backend folder
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+BASE_DIR = os.path.dirname(__file__)
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "uploads"))
+Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 # Focus areas derived from env priority terms
 def _env_list(name: str) -> List[str]:
@@ -231,6 +236,35 @@ def _ensure_schema(conn: sqlite3.Connection):
                 posted_date TEXT,
                 due_date TEXT,
                 ai_summary TEXT,
+                ai_full_summary TEXT,
+                ai_insights TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        try:
+            conn.execute("ALTER TABLE saved_rfps ADD COLUMN ai_full_summary TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE saved_rfps ADD COLUMN ai_insights TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE saved_rfps ADD COLUMN due_date TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE saved_rfps ADD COLUMN ai_summary TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                saved_rfp_id INTEGER,
+                rfp_id INTEGER,
+                note TEXT,
                 created_at TEXT
             )
             """
@@ -262,12 +296,42 @@ def _conn():
     _ensure_schema(conn)
     return conn
 
+def _saved_folder(saved_id: int) -> str:
+    folder = os.path.join(UPLOAD_DIR, f"saved_{saved_id}")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def _list_documents(saved_id: int) -> List[str]:
+    folder = os.path.join(UPLOAD_DIR, f"saved_{saved_id}")
+    if not os.path.isdir(folder):
+        return []
+    return sorted([f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))])
+
+def _get_saved_entry(rfp_id: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, rfp_id, title, agency, summary, description, url, score, posted_date, due_date,
+               ai_summary, ai_full_summary, ai_insights, created_at
+        FROM saved_rfps
+        WHERE rfp_id=?
+        """,
+        (rfp_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
 class RefreshResponse(BaseModel):
     message: str
     errors: List[str] = []
 
 class SaveRequest(BaseModel):
     generate_summary: bool = True
+
+class NoteRequest(BaseModel):
+    note: str
 
 @app.get("/progress")
 def get_progress():
@@ -284,16 +348,17 @@ def list_rfps(
     conn = _conn()
     cur = conn.cursor()
     due_clause = "(due_date IS NULL OR due_date = '' OR date(due_date) >= date('now'))"
+    recent_clause = "(date(posted_date) >= date('now', '-60 days'))"
 
     # total count (for pagination header)
     if q.strip():
         like = f"%{q.strip()}%"
         cur.execute(
-            f"SELECT COUNT(*) FROM rfps WHERE {due_clause} AND (title LIKE ? OR summary LIKE ? OR agency LIKE ?)",
+            f"SELECT COUNT(*) FROM rfps WHERE {due_clause} AND {recent_clause} AND (title LIKE ? OR summary LIKE ? OR agency LIKE ?)",
             (like, like, like),
         )
     else:
-        cur.execute(f"SELECT COUNT(*) FROM rfps WHERE {due_clause}")
+        cur.execute(f"SELECT COUNT(*) FROM rfps WHERE {due_clause} AND {recent_clause}")
     total = int(cur.fetchone()[0])
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
@@ -304,8 +369,10 @@ def list_rfps(
             f"""
             SELECT id, title, agency, summary, description, url, score, posted_date, due_date, created_at
             FROM rfps
-            WHERE {due_clause} AND (title LIKE ? OR summary LIKE ? OR agency LIKE ?)
-            ORDER BY score DESC, datetime(created_at) DESC
+            WHERE {due_clause} AND {recent_clause} AND (title LIKE ? OR summary LIKE ? OR agency LIKE ?)
+            ORDER BY score DESC,
+                     datetime(posted_date) DESC,
+                     datetime(created_at) DESC
             LIMIT ? OFFSET ?
             """,
             (like, like, like, limit, offset),
@@ -315,8 +382,10 @@ def list_rfps(
             f"""
             SELECT id, title, agency, summary, description, url, score, posted_date, due_date, created_at
             FROM rfps
-            WHERE {due_clause}
-            ORDER BY score DESC, datetime(created_at) DESC
+            WHERE {due_clause} AND {recent_clause}
+            ORDER BY score DESC,
+                     datetime(posted_date) DESC,
+                     datetime(created_at) DESC
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -334,6 +403,216 @@ def list_rfps(
         row["focus_tags"] = _extract_focus_tags(haystack)
     conn.close()
     return rows
+
+@app.get("/saved")
+def list_saved():
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, rfp_id, title, agency, summary, description, url, score, posted_date, due_date, ai_summary, ai_full_summary, ai_insights, created_at
+        FROM saved_rfps
+        ORDER BY datetime(created_at) DESC
+        """
+    )
+    rows = []
+    for r in cur.fetchall():
+        row = dict(r)
+        row["posted_date"] = _format_posted_date(row.get("posted_date", ""))
+        row["due_date"] = _format_due_date(row.get("due_date", ""))
+        rows.append(row)
+    conn.close()
+    return rows
+
+@app.get("/saved/{rfp_id}")
+def get_saved_detail(rfp_id: int):
+    entry = _get_saved_entry(rfp_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Saved RFP not found")
+    entry["posted_date"] = _format_posted_date(entry.get("posted_date", ""))
+    entry["due_date"] = _format_due_date(entry.get("due_date", ""))
+    saved_id = entry["id"]
+    entry["documents"] = _list_documents(saved_id)
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, note, created_at
+        FROM saved_notes
+        WHERE rfp_id=?
+        ORDER BY datetime(created_at) DESC
+        """,
+        (rfp_id,),
+    )
+    entry["notes"] = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return entry
+
+@app.post("/rfps/{rfp_id}/save")
+def save_rfp_item(rfp_id: int, payload: SaveRequest):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, title, agency, summary, description, url, score, posted_date, due_date
+        FROM rfps
+        WHERE id=?
+        """,
+        (rfp_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="RFP not found")
+    record = dict(row)
+    title = record.get("title", "")
+    agency = record.get("agency", "")
+    description = record.get("description", "")
+    posted_date = _format_posted_date(record.get("posted_date", ""))
+    due_date = _format_due_date(record.get("due_date", ""))
+    url = record.get("url", "")
+    score = float(record.get("score") or 0.0)
+    summary = record.get("summary", "")
+
+    ai_summary = ""
+    ai_full_summary = ""
+    ai_insights = ""
+    if payload.generate_summary:
+        rfp_text = (
+            f"{title}\n\nAgency: {agency}\n\n{description}\n\nURL: {url or '(pending)'}"
+            f"\nPosted: {posted_date or '(unspecified)'}\nDue: {due_date or '(unspecified)'}"
+        )
+        try:
+            ai_summary = ""
+            ai_full_summary = structured_summary(rfp_text)
+            ai_insights = strategic_insights(rfp_text)
+        except Exception as e:
+            ai_full_summary = f"(summary unavailable: {type(e).__name__}: {e})"
+            ai_insights = ""
+
+    cur.execute(
+        """
+        INSERT INTO saved_rfps(rfp_id, title, agency, summary, description, url, score, posted_date, due_date, ai_summary, ai_full_summary, ai_insights, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(rfp_id) DO UPDATE SET
+            title=excluded.title,
+            agency=excluded.agency,
+            summary=excluded.summary,
+            description=excluded.description,
+            url=excluded.url,
+            score=excluded.score,
+            posted_date=excluded.posted_date,
+            due_date=excluded.due_date,
+            ai_summary=excluded.ai_summary,
+            ai_full_summary=excluded.ai_full_summary,
+            ai_insights=excluded.ai_insights,
+            created_at=excluded.created_at
+        """,
+        (
+            rfp_id,
+            title,
+            agency,
+            summary,
+            description,
+            url,
+            score,
+            posted_date,
+            due_date,
+            ai_summary,
+            ai_full_summary,
+            ai_insights,
+            datetime.utcnow().isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    cur.execute(
+        "SELECT id, rfp_id, title, agency, summary, description, url, score, posted_date, due_date, ai_summary, ai_full_summary, ai_insights, created_at FROM saved_rfps WHERE rfp_id=?",
+        (rfp_id,),
+    )
+    saved = dict(cur.fetchone())
+    saved["posted_date"] = _format_posted_date(saved.get("posted_date", ""))
+    saved["due_date"] = _format_due_date(saved.get("due_date", ""))
+    conn.close()
+    return saved
+
+@app.delete("/saved/{rfp_id}")
+def delete_saved_rfp(rfp_id: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM saved_rfps WHERE rfp_id=?", (rfp_id,))
+    conn.commit()
+    conn.close()
+    return {"deleted": True, "rfp_id": rfp_id}
+
+@app.get("/saved/{rfp_id}/documents/{filename}")
+def download_saved_document(rfp_id: int, filename: str):
+    entry = _get_saved_entry(rfp_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Saved RFP not found")
+    safe_name = os.path.basename(filename)
+    folder = _saved_folder(entry["id"])
+    path = os.path.join(folder, safe_name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, filename=safe_name)
+
+@app.post("/saved/{rfp_id}/upload")
+async def upload_saved_document(rfp_id: int, file: UploadFile = File(...)):
+    entry = _get_saved_entry(rfp_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Saved RFP not found")
+    saved_id = entry["id"]
+    data = await file.read()
+    folder = _saved_folder(saved_id)
+    os.makedirs(folder, exist_ok=True)
+    safe_name = os.path.basename(file.filename)
+    path = os.path.join(folder, safe_name)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    try:
+        doc_text = data.decode("utf-8")
+    except Exception:
+        doc_text = ""
+    combined = (
+        f"{entry.get('title','')}\nAgency: {entry.get('agency','')}\n\n"
+        f"{entry.get('description','')}\n\nUploaded Document ({safe_name}):\n{doc_text or '(binary file)'}"
+    )
+    full_summary = structured_summary(combined)
+    insights = strategic_insights(combined)
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE saved_rfps
+        SET ai_full_summary=?, ai_insights=?
+        WHERE id=?
+        """,
+        (full_summary, insights, saved_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_saved_detail(rfp_id)
+
+@app.post("/saved/{rfp_id}/notes")
+def add_saved_note(rfp_id: int, payload: NoteRequest):
+    entry = _get_saved_entry(rfp_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Saved RFP not found")
+    note = (payload.note or "").strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Note cannot be blank")
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO saved_notes(saved_rfp_id, rfp_id, note, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (entry["id"], rfp_id, note, datetime.utcnow().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    conn.close()
+    return get_saved_detail(rfp_id)
 
 @app.post("/refresh", response_model=RefreshResponse)
 def refresh_rfps(limit: int = 300, no_ai: bool = False):

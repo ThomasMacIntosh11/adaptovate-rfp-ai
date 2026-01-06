@@ -4,6 +4,8 @@ import re
 from typing import List, Dict, Any
 
 from .rfp_sources_canadabuys import fetch_canadabuys_tenders
+from .rfp_sources_bidscanada import fetch_bidscanada_tenders
+from .rfp_sources_globaltenders import fetch_globaltenders_consultancy
 from .rfp_sources_merx import fetch_merx_tenders, refresh_merx_snapshots
 
 def _env_list(name: str) -> List[str]:
@@ -118,6 +120,37 @@ def scrape_real_rfps(limit: int = 300) -> List[Dict[str, Any]]:
                 items = merx_items + items  # ensure MERX rows aren't truncated by limit
         except Exception as e:
             print(f"[MERX] failed: {type(e).__name__}: {e}")
+
+    enable_bidscanada = os.getenv("ENABLE_BIDSCANADA", "true").strip().lower() != "false"
+    if enable_bidscanada:
+        try:
+            max_rows = int(os.getenv("BIDSCANADA_MAX_ROWS", "200"))
+        except ValueError:
+            max_rows = 200
+        try:
+            bidscan_items = fetch_bidscanada_tenders(max_rows=max_rows)
+            for it in bidscan_items:
+                it["_source"] = "bidsCanada"
+                it["_force_unspsc_pass"] = True
+                it["_force_keyword_pass"] = True
+            items.extend(bidscan_items)
+        except Exception as e:
+            print(f"[BIDSCANADA] failed: {type(e).__name__}: {e}")
+
+    enable_globaltenders = os.getenv("ENABLE_GLOBALTENDERS", "true").strip().lower() != "false"
+    if enable_globaltenders:
+        try:
+            max_pages = int(os.getenv("GLOBALTENDERS_MAX_PAGES", "0"))
+        except ValueError:
+            max_pages = 0
+        try:
+            gt_items = fetch_globaltenders_consultancy(max_pages=max_pages)
+            for it in gt_items:
+                it["_source"] = "GlobalTenders"
+                it["_force_unspsc_pass"] = True
+            items.extend(gt_items)
+        except Exception as e:
+            print(f"[GLOBALTENDERS] failed: {type(e).__name__}: {e}")
 
     # 2) UNSPSC filter
     unspsc_targets = [u.strip().lower() for u in (_env_list("FILTER_UNSPSC"))]

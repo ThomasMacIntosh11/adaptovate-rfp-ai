@@ -84,3 +84,87 @@ def score_relevance(rfp_text: str) -> Dict[str, int]:
         return {"score": sc, "rationale": str(data.get("rationale", ""))[:400]}
     except Exception as e:
         return {"score": 0, "rationale": f"model error: {type(e).__name__}: {e}"}
+
+def structured_summary(rfp_text: str) -> str:
+    """
+    Generate a structured, bullet-style summary for saved RFPs.
+    """
+    client = _get_client()
+    prompt = (
+        "You are a senior consulting partner writing a bid/no-bid brief. "
+        "Use ONLY the provided RFP text; do not invent details. "
+        "If a field is missing, write 'Not specified'. "
+        "Use the exact format below with section headers and '-' bullets. "
+        "Keep each bullet <= 20 words."
+        "\n\n"
+        "Opportunity Overview:\n"
+        "- Buyer/Agency: ...\n"
+        "- Purpose/Need: ...\n"
+        "- Scope/Workstreams: ...\n"
+        "- Location/Region: ...\n"
+        "- Contract Type/Vehicle: ...\n"
+        "- Estimated Value/Budget: ...\n"
+        "Key Deliverables:\n"
+        "- ...\n"
+        "- ...\n"
+        "- ...\n"
+        "Evaluation & Compliance:\n"
+        "- Evaluation Criteria: ...\n"
+        "- Submission Requirements: ...\n"
+        "- Mandatory Qualifications: ...\n"
+        "Timeline:\n"
+        "- Posted: ...\n"
+        "- Proposal Due: ...\n"
+        "- Q&A/Clarifications: ...\n"
+        "- Anticipated Start: ...\n"
+        "- Anticipated End: ...\n"
+        "Risks/Considerations:\n"
+        "- ...\n"
+        "- ...\n"
+        "Bid Recommendation:\n"
+        "- Go/No-Go: Go | No-Go | Insufficient info\n"
+        "- Rationale: ...\n\n"
+        "RFP TEXT:\n"
+        f"{rfp_text}"
+    )
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": "You are a proposal analyst. Follow the requested structure exactly."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.output_text if hasattr(resp, "output_text") else ""
+        if not content and hasattr(resp, "choices"):
+            content = resp.choices[0].message.content
+        return (content or "").strip()
+    except Exception as e:
+        return f"(structured summary unavailable: {type(e).__name__}: {e})"
+
+def strategic_insights(rfp_text: str) -> str:
+    """
+    Produce 3-5 strategic insights about the buyer/org based on context.
+    """
+    client = _get_client()
+    prompt = (
+        "Using the RFP context provided, list 3-5 strategic insights or hypotheses about the buyer's "
+        "current situation (leadership changes, transformations, risks, tech adoption). "
+        "Use bullet points prefixed with '- '. Keep each under 20 words. If info unavailable, "
+        "state that explicitly.\n\n"
+        f"RFP CONTEXT:\n{rfp_text}\n"
+    )
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": "You are a strategic intelligence analyst."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.output_text if hasattr(resp, "output_text") else ""
+        if not content and hasattr(resp, "choices"):
+            content = resp.choices[0].message.content
+        return (content or "").strip()
+    except Exception as e:
+        return f"(insights unavailable: {type(e).__name__}: {e})"
